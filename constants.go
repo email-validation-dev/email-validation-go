@@ -3,7 +3,7 @@ package emailvalidation
 import "time"
 
 // Version is the SDK version. It is sent in the User-Agent header.
-const Version = "1.0.0"
+const Version = "1.1.0"
 
 // DefaultBaseURL is the API's base URL.
 const DefaultBaseURL = "https://api.email-validation.org"
@@ -37,9 +37,26 @@ const (
 	StatusDisposable Status = "disposable"
 )
 
-// FilterAll is the results filter that keeps every row (the server default). It is only meaningful in
-// ResultsOptions.Filter.
+// FilterAll keeps every row (the server default) in ResultsOptions.Filter, the 1.0.0 field. It stays a Status for
+// that field; RowFilter uses ResultsFilterAll.
 const FilterAll Status = "all"
+
+// ResultsFilter selects the rows of a results download (ResultsOptions.RowFilter, DownloadOptions.RowFilter):
+// ResultsFilterAll or one of the five statuses. It is not a Status: "all" is not a verdict. Since 1.1.0.
+type ResultsFilter string
+
+// ResultsFilterAll is the RowFilter that keeps every row (the server default). Use it alone, never in a list.
+const ResultsFilterAll ResultsFilter = "all"
+
+// FilterStatuses turns statuses into a RowFilter: FilterStatuses(StatusValid, StatusCatchAll) keeps the rows with
+// either status. With no status it gives an empty list, which RowFilter refuses.
+func FilterStatuses(statuses ...Status) []ResultsFilter {
+	out := make([]ResultsFilter, len(statuses))
+	for i, s := range statuses {
+		out[i] = ResultsFilter(s)
+	}
+	return out
+}
 
 // Reason explains a status. Each reason has a fixed status and action (see ReasonInfo). Unknown future values are
 // kept as the raw string.

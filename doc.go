@@ -31,6 +31,12 @@
 //
 // Every method takes a context.Context. Cancelling it (or its deadline passing) stops the call and any retry or poll
 // wait at once with a ConnectionError of Code CodeAborted; errors.Is(err, context.Canceled) (or
-// context.DeadlineExceeded) also holds. A cancelled call is never retried. The per-attempt timeout (WithTimeout,
-// default 30 s) is separate and gives Code CodeTimeout.
+// context.DeadlineExceeded) also holds. A cancelled call is never retried.
+//
+// # Timeouts
+//
+// The per-attempt timeout (WithTimeout, default 30 s; WithRequestTimeout for one call) gives Code CodeTimeout. It
+// bounds the whole attempt of a JSON call, and is an idle timeout for transfers (a file upload, results and
+// downloads), so a slow but progressing transfer is never cut. The client enforces it even when a Transport ignores
+// the context.
 package emailvalidation

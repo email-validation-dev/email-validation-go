@@ -133,7 +133,7 @@ func ExampleBulkService() {
 		log.Fatalf("job ended %s", job.Status)
 	}
 	csv, err := client.Bulk.Results(ctx, job.ID, &emailvalidation.ResultsOptions{
-		Filter: []emailvalidation.Status{emailvalidation.StatusValid},
+		RowFilter: emailvalidation.FilterStatuses(emailvalidation.StatusValid),
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -167,7 +167,8 @@ func ExampleBulkService_Create_file() {
 }
 
 func ExampleBulkService_ResultsStream() {
-	client, err := emailvalidation.New(os.Getenv("EV_API_KEY"), emailvalidation.WithTimeout(10*time.Minute))
+	// The timeout of a download is an idle timeout: a large file is never cut while it progresses.
+	client, err := emailvalidation.New(os.Getenv("EV_API_KEY"))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -184,6 +185,40 @@ func ExampleBulkService_ResultsStream() {
 	if _, err := io.Copy(out, stream); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func ExampleBulkService_Download() {
+	client, err := emailvalidation.New(os.Getenv("EV_API_KEY"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	// After a failure, the same call resumes where results.csv ends.
+	size, err := client.Bulk.Download(context.Background(), "job_3Fv8QpL2xM7nC1rT9kW4yB", "results.csv", nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(size, "bytes")
+}
+
+func ExampleWithRequestTimeout() {
+	client, err := emailvalidation.New(os.Getenv("EV_API_KEY"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	ctx := emailvalidation.WithRequestTimeout(context.Background(), 5*time.Second) // this call only
+	if _, err := client.Credits(ctx); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func ExampleHeadersFromMap() {
+	headers := emailvalidation.HeadersFromMap(map[string]string{
+		"webhook-id":        "msg_p5jXN8AQM9LWM0D4loKWxJek",
+		"webhook-timestamp": "1614265330",
+		"webhook-signature": "v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE=",
+	})
+	_, err := emailvalidation.VerifyWebhook([]byte(`{"test": 2432232314}`), headers, os.Getenv("EV_WEBHOOK_SECRET"), nil)
+	fmt.Println(err)
 }
 
 func ExampleVerifyWebhook() {

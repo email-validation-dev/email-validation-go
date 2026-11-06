@@ -4,6 +4,35 @@ All notable changes to the Go SDK. The format follows [Keep a Changelog](https:/
 SDK uses [Semantic Versioning](https://semver.org/): a new vocabulary value, option or operation is a minor release;
 a removed or renamed public symbol is a major one. The SDK targets API v1 (`/v1/…`).
 
+## [1.1.0] - 2026-11-06
+
+Hardening: one behaviour for retries, timeouts, errors, bulk transfers and webhooks across the official SDKs.
+
+### Added
+
+- `WithRequestTimeout(ctx, d)`: a timeout for the calls made with that context, replacing `WithTimeout`; its
+  expiry is a `ConnectionError` with code `timeout` (a plain context deadline stays `aborted`).
+- `Bulk.Download(ctx, jobID, path, *DownloadOptions)`: streams the result CSV into a file and resumes a partial
+  file with `Range: bytes=<size>-` (a `416` with `Content-Range: bytes */<size>` means already complete).
+- `HeadersFromMap(map[string]string)` for `VerifyWebhook`.
+- `ResultsOptions.RowFilter` (and `DownloadOptions.RowFilter`), a `[]ResultsFilter`, with `ResultsFilterAll` and
+  `FilterStatuses(...)`: an empty list, `all` inside a list, and `spamtrap`, `abuse`, `do_not_mail` or `risky` are
+  refused before sending. The 1.0.0 `ResultsOptions.Filter []Status` and `FilterAll` (a `Status`) are unchanged and
+  behave as before (an empty list means every row); setting `Filter` and `RowFilter` together is refused.
+
+### Fixed
+
+- Transfers (`Bulk.Create` with a `File`, `Bulk.Results`, `Bulk.ResultsStream`) use the timeout as an idle timeout:
+  a slow but progressing upload or download is no longer cut after 30 s, and a results stream no longer fails 30 s
+  after the request started while the caller reads it. Each stream read waits at most the timeout, and read errors
+  are `*Error` (`timeout`, `connection_error` or `aborted`), never a raw `context.DeadlineExceeded`.
+- Uploads allow for the kernel's send buffer: while the file is sent, and while its answer is awaited after the last
+  byte, the idle bound is `timeout + min(size, 4 MiB) ÷ 128 KiB/s`, so an upload whose buffered tail drains slowly
+  is no longer cut after the server has the whole file.
+- The SDK bounds every attempt itself, so a transport or response body that ignores the context cannot hang a call.
+- `VerifyWebhook` verifies signatures joined with `, ` and refuses a body that is not a JSON object.
+- A dead-socket test proves a `POST` or `DELETE` is sent once when the connection dies after the request was read.
+
 ## [1.0.0] - 2026-11-04
 
 First version, at parity with the JavaScript and Python SDKs.

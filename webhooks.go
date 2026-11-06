@@ -1,6 +1,7 @@
 package emailvalidation
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -55,6 +56,16 @@ func header(h http.Header, name string) string {
 	return strings.Join(values, " ")
 }
 
+// HeadersFromMap turns a map of header names to single values (from a framework or a queue message) into the
+// http.Header that VerifyWebhook takes. The names are kept as given: VerifyWebhook looks them up in any case.
+func HeadersFromMap(m map[string]string) http.Header {
+	h := make(http.Header, len(m))
+	for k, v := range m {
+		h[k] = append(h[k], v)
+	}
+	return h
+}
+
 func validTimestamp(ts string) bool {
 	return len(ts) >= 1 && len(ts) <= 12 && isDigits(ts)
 }
@@ -97,7 +108,8 @@ func SignWebhook(msgID string, timestamp int64, payload []byte, secret string) (
 }
 
 // VerifyWebhook checks a delivery and returns the parsed event. Pass the raw request body (before any JSON
-// parsing) and the request headers (names in any case). It returns a *WebhookVerificationError when headers are
+// parsing) and the request headers: r.Header, or HeadersFromMap for a map of single values. Names match in any
+// case; several values of a name are joined with a space, and signatures joined with ", " still verify. It returns a *WebhookVerificationError when headers are
 // missing, the timestamp is malformed or outside the tolerance, the secret is invalid, no signature matches or the
 // body is not JSON. opts may be nil.
 //
@@ -132,8 +144,9 @@ func VerifyWebhook(payload []byte, headers http.Header, secret string, opts *Web
 		return nil, err
 	}
 	expected := webhookMAC(key, id, timestamp, payload)
-	for _, entry := range strings.Split(signatures, " ") {
-		version, sig, found := strings.Cut(entry, ",")
+	for _, entry := range strings.Fields(signatures) {
+		// A stack that joins repeated header lines with ", " leaves a trailing comma on all but the last entry.
+		version, sig, found := strings.Cut(strings.TrimSuffix(entry, ","), ",")
 		if !found || version != "v1" || sig == "" {
 			continue
 		}
@@ -142,12 +155,20 @@ func VerifyWebhook(payload []byte, headers http.Header, secret string, opts *Web
 			continue
 		}
 		if hmac.Equal(given, expected) { // constant time
-			var event WebhookEvent
-			if err := json.Unmarshal(payload, &event); err != nil {
+			if !isJSONObject(payload) || !json.Valid(payload) {
 				return nil, webhookError(msgWebhookNotJSON)
 			}
+			// Any object is an event (forward compatible): a field of an unexpected type is left empty.
+			var event WebhookEvent
+			_ = json.Unmarshal(payload, &event)
 			return &event, nil
 		}
 	}
 	return nil, webhookError(msgWebhookNoMatch)
+}
+
+// isJSONObject reports whether the body starts as a JSON object (null, arrays and scalars are not events).
+func isJSONObject(payload []byte) bool {
+	trimmed := bytes.TrimLeft(payload, " \t\r\n")
+	return len(trimmed) > 0 && trimmed[0] == '{'
 }

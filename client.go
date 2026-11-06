@@ -54,9 +54,33 @@ type settings struct {
 // slashes are removed.
 func WithBaseURL(baseURL string) Option { return func(s *settings) { s.baseURL = baseURL } }
 
-// WithTimeout sets the timeout of each attempt, covering connect and the full response (default 30 s; must be
-// > 0). A check may take up to 15 s on our side: keep it a few seconds above the Validate TimeoutSeconds.
+// WithTimeout sets the timeout of each attempt (default 30 s; must be > 0). For JSON calls it bounds the whole
+// attempt: connect, send and the full response. For transfers (Bulk.Create with a File, Bulk.Results,
+// Bulk.ResultsStream and Bulk.Download) it is an idle timeout: the attempt fails only when no byte was sent or
+// received for that long, so a slow but progressing 100 MB upload or download is never cut. A check may take up to
+// 15 s on our side: keep it a few seconds above the Validate TimeoutSeconds. WithRequestTimeout changes it for one
+// call.
 func WithTimeout(d time.Duration) Option { return func(s *settings) { s.timeout = d } }
+
+type requestTimeoutKey struct{}
+
+// WithRequestTimeout returns a context that replaces the client's timeout (WithTimeout) for the calls made with it,
+// with the same JSON and transfer rules; its expiry is a ConnectionError with code timeout. d must be > 0 (a call
+// with another value fails with an error wrapping ErrInvalidArgument before sending). A plain context deadline is
+// different: it ends the whole call, retries included, with code aborted.
+func WithRequestTimeout(ctx context.Context, d time.Duration) context.Context {
+	return context.WithValue(ctx, requestTimeoutKey{}, d)
+}
+
+func (c *Client) timeoutFor(ctx context.Context) (time.Duration, error) {
+	if d, ok := ctx.Value(requestTimeoutKey{}).(time.Duration); ok {
+		if d <= 0 {
+			return 0, argError("the request timeout must be positive")
+		}
+		return d, nil
+	}
+	return c.timeout, nil
+}
 
 // WithMaxRetries sets how many times a call is retried after the first attempt (default 2; negative means 0).
 func WithMaxRetries(n int) Option { return func(s *settings) { s.maxRetries = n } }
@@ -255,6 +279,11 @@ type call struct {
 	contentType string
 	accept      string
 	rangeHeader string
+	// long marks a transfer (a file upload or a results download): its timeout is an idle timeout.
+	long bool
+	// passStatus is a non-2xx status that send returns as an answer instead of an error (Download reads the
+	// Content-Range of a 416).
+	passStatus int
 }
 
 // answer is a successful (2xx) response: body holds the whole body, or stream is open (and must be closed).
@@ -299,7 +328,7 @@ func (c *Client) doJSON(ctx context.Context, cl *call, out any) error {
 	return nil
 }
 
-func (c *Client) buildRequest(cl *call) *Request {
+func (c *Client) buildRequest(cl *call, timeout time.Duration) *Request {
 	u := c.baseURL + cl.path
 	if len(cl.query) > 0 {
 		u += "?" + cl.query.Encode()
@@ -318,55 +347,66 @@ func (c *Client) buildRequest(cl *call) *Request {
 	if cl.rangeHeader != "" {
 		h.Set("Range", cl.rangeHeader)
 	}
-	return &Request{Method: cl.method, URL: u, Header: h, Body: cl.body, Timeout: c.timeout}
+	return &Request{Method: cl.method, URL: u, Header: h, Body: cl.body, Timeout: timeout}
 }
 
-// send runs the retry loop. With stream, a 2xx answer's body is returned open; the per-attempt timeout keeps
-// running until it is closed.
+// send runs the retry loop. With stream, a 2xx answer (or one with cl.passStatus) is returned with its body open: the
+// caller must close it, and each read is bounded by the idle timeout.
 func (c *Client) send(ctx context.Context, cl *call, stream bool) (*answer, error) {
-	req := c.buildRequest(cl)
+	timeout, err := c.timeoutFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	req := c.buildRequest(cl, timeout)
+	long := cl.long || stream
+	// The built-in transport reports upload progress, and each progress allows the send buffer to drain; another
+	// transport gets size ÷ 128 KiB/s on top of the idle timeout.
+	var allowance, drain time.Duration
+	if long && len(cl.body) > 0 {
+		drain = drainAllowance(len(cl.body))
+		if _, ours := c.transport.(*HTTPTransport); !ours {
+			allowance = time.Duration(float64(len(cl.body)) / uploadRate * float64(time.Second))
+		}
+	}
 	for attempt := 0; ; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, abortedError(err)
 		}
-		actx, cancel := context.WithTimeout(ctx, c.timeout)
+		at := newAttempt(ctx, long, timeout, allowance, drain)
 		attemptReq := *req
 		attemptReq.Header = req.Header.Clone()
-		res, err := c.transport.Do(actx, &attemptReq)
+		attemptReq.progress = at.progress
+		res, err := at.do(c.transport, &attemptReq)
 		if err != nil && res != nil && res.Body != nil {
 			_ = res.Body.Close() // a misbehaving transport returned both: never leak the body
 		}
-		var body []byte
 		if err == nil && res == nil {
 			err = &TransportError{Err: fmt.Errorf("transport returned no response")}
 		}
+		var body []byte
 		if err == nil {
-			if stream && res.StatusCode >= 200 && res.StatusCode < 300 {
-				return &answer{
-					status: res.StatusCode,
-					header: res.Header,
-					stream: &cancelOnClose{ReadCloser: bodyOrEmpty(res.Body), cancel: cancel},
-				}, nil
+			at.headersArrived()
+			ok := res.StatusCode >= 200 && res.StatusCode < 300
+			if stream && (ok || (cl.passStatus != 0 && res.StatusCode == cl.passStatus)) {
+				return &answer{status: res.StatusCode, header: res.Header, stream: at.body(res.Body)}, nil
 			}
-			body, err = readAll(res.Body)
+			b := at.body(res.Body)
+			body, err = io.ReadAll(b)
+			_ = b.Close()
 		}
-		cancel()
+		at.close()
 
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return nil, abortedError(ctxErr)
 			}
-			timedOut := actx.Err() == context.DeadlineExceeded || isTimeout(err)
 			if cl.method == http.MethodGet && attempt < c.maxRetries {
 				if err := c.pause(ctx, backoff(attempt)); err != nil {
 					return nil, err
 				}
 				continue
 			}
-			if timedOut {
-				return nil, &Error{Kind: KindConnection, Code: CodeTimeout, Message: msgTimedOut, Err: err}
-			}
-			return nil, &Error{Kind: KindConnection, Code: CodeConnectionError, Message: msgUnreachable, Err: err}
+			return nil, at.failure(err)
 		}
 
 		if res.StatusCode >= 200 && res.StatusCode < 300 {
@@ -390,36 +430,6 @@ func (c *Client) send(ctx context.Context, cl *call, stream bool) (*answer, erro
 		}
 		return nil, apiErr
 	}
-}
-
-func bodyOrEmpty(b io.ReadCloser) io.ReadCloser {
-	if b == nil {
-		return io.NopCloser(bytes.NewReader(nil))
-	}
-	return b
-}
-
-func readAll(b io.ReadCloser) ([]byte, error) {
-	if b == nil {
-		return []byte{}, nil
-	}
-	defer b.Close()
-	data, err := io.ReadAll(b)
-	if err != nil {
-		return nil, &TransportError{Timeout: isTimeout(err), Err: err}
-	}
-	return data, nil
-}
-
-type cancelOnClose struct {
-	io.ReadCloser
-	cancel context.CancelFunc
-}
-
-func (c *cancelOnClose) Close() error {
-	err := c.ReadCloser.Close()
-	c.cancel()
-	return err
 }
 
 func abortedError(cause error) *Error {

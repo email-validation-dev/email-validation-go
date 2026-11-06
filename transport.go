@@ -14,9 +14,12 @@ import (
 // Transport sends one HTTP attempt. The client builds the request, applies retries and maps errors; a Transport only
 // moves bytes. Replace it (WithTransport) to use your own HTTP stack, a proxy library or a fake in tests.
 //
-// Do must honour ctx (it carries the per-attempt timeout and the caller's cancellation), must not follow redirects
-// (return the 3xx answer instead) and returns either a *Response (any status) or an error when no HTTP answer
-// arrived. Return a *TransportError to say whether that was a timeout.
+// Do should honour ctx: it is done when the caller cancels or the attempt's timeout passes (a deadline for JSON
+// calls; for transfers the client cancels it after Request.Timeout without progress). The client enforces both
+// bounds itself as well, so a transport that ignores ctx cannot hang a call, but it may keep working in the
+// background. Do must not follow redirects (return the 3xx answer instead) and returns either a *Response (any
+// status) or an error when no HTTP answer arrived. Return a *TransportError to say whether that was a timeout.
+// Send Body with its length (a Content-Length header): the API refuses chunked uploads.
 type Transport interface {
 	Do(ctx context.Context, req *Request) (*Response, error)
 }
@@ -31,8 +34,13 @@ type Request struct {
 	Header http.Header `json:"-"`
 	// Body is nil when the request has none. It is the same bytes on every retry.
 	Body []byte `json:"-"`
-	// Timeout is the client's per-attempt timeout (ctx already carries it as a deadline).
+	// Timeout is the attempt's timeout (the client's, or the call's WithRequestTimeout): a deadline on the whole
+	// attempt for JSON calls, an idle timeout for transfers. The client already applies it through ctx.
 	Timeout time.Duration
+
+	// progress is called as the built-in transport hands upload bytes to the connection (the idle timeout of a
+	// transfer starts again).
+	progress func()
 }
 
 // String shows the method and URL only.
@@ -95,9 +103,19 @@ func (t *HTTPTransport) Do(ctx context.Context, req *Request) (*Response, error)
 	if req.Body != nil {
 		body = bytes.NewReader(req.Body) // known length: never a chunked upload
 	}
+	if len(req.Body) > 0 && req.progress != nil {
+		body = &progressReader{r: bytes.NewReader(req.Body), progress: req.progress}
+	}
 	hr, err := http.NewRequestWithContext(ctx, req.Method, req.URL, body)
 	if err != nil {
 		return nil, &TransportError{Err: err}
+	}
+	if pr, ok := body.(*progressReader); ok {
+		// Only a bare *bytes.Reader gets these inferred: without a length the upload would be chunked (and refused).
+		hr.ContentLength = int64(len(req.Body))
+		hr.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(&progressReader{r: bytes.NewReader(req.Body), progress: pr.progress}), nil
+		}
 	}
 	hr.Header = req.Header.Clone()
 	res, err := t.client.Do(hr)
@@ -105,6 +123,20 @@ func (t *HTTPTransport) Do(ctx context.Context, req *Request) (*Response, error)
 		return nil, &TransportError{Timeout: isTimeout(err), Err: err}
 	}
 	return &Response{StatusCode: res.StatusCode, Header: res.Header, Body: res.Body}, nil
+}
+
+// progressReader reports every read that moved bytes.
+type progressReader struct {
+	r        *bytes.Reader
+	progress func()
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 {
+		p.progress()
+	}
+	return n, err
 }
 
 // closeIdleConnections releases idle connections of the wrapped client.

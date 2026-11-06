@@ -137,6 +137,7 @@ const (
 	msgBadJobID     = "Not a bulk job id (expected job_ followed by 22 letters and digits)."
 	msgRangeRefused = "This download cannot be fetched in parts: use Filter \"all\" (or one status with " +
 		"EscapeFormulas false) and Columns \"original\" with a Range."
+	msgFileFailed = "The results file could not be opened or written."
 )
 
 func kindForStatus(status int) ErrorKind {
